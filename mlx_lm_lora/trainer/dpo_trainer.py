@@ -21,7 +21,9 @@ class DPOTrainingArgs(SFTTrainingArgs):
     )
     loss_type: str = field(
         default="sigmoid",
-        metadata={"help": "DPO loss type: 'sigmoid', 'hinge', 'ipo', or 'dpop'."},
+        metadata={
+            "help": "DPO loss type: 'sigmoid', 'hinge', 'ipo', 'dpop', or 'length_normalized'."
+        },
     )
     delta: float = field(
         default=50.0, metadata={"help": "Delta parameter for DPOP loss type."}
@@ -42,7 +44,9 @@ def get_token_scores(model, x, mask):
 
 def compute_score(scores, mask, loss_type):
     token_count = mask.sum(-1)
-    return scores.sum(-1) / token_count if loss_type == "ipo" else scores.sum(-1)
+    if loss_type in ("ipo", "length_normalized"):
+        return scores.sum(-1) / token_count
+    return scores.sum(-1)
 
 
 def dpo_loss(
@@ -74,6 +78,17 @@ def dpo_loss(
             reference_chosen_score - policy_chosen_score,
         )
         losses = -(nn.log_sigmoid(beta * logits) - delta * penalty)
+    elif loss_type == "length_normalized":
+        # Length-normalized DPO: compute_score (lines 45-49) already divided
+        # the per-token sums by token count for this loss_type, so the upstream
+        # `logits` variable is the difference of *per-token-averaged* log-probs
+        # rather than raw sequence sums. β operates on a smaller-magnitude
+        # signal here, so the useful β is approximately an order of magnitude
+        # larger than vanilla sigmoid DPO; e.g. AllenAI Tulu-3 uses β=5.0
+        # with length-normalized (loss_type: dpo_norm, beta: 5 in
+        # external/reference/open-instruct/configs/train_configs/tulu3/tulu3_dpo_8b.yaml)
+        # vs the conventional β≈0.1 with sigmoid.
+        losses = -nn.log_sigmoid(beta * logits)
     else:
         raise ValueError(f"Unknown loss type: {loss_type}")
 

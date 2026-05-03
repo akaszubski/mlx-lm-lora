@@ -179,7 +179,7 @@ mlx_lm_lora.train \
 **Key Parameters:**
 
 - `--beta`: KL penalty strength (default: 0.1)
-- `--dpo-cpo-loss-type`: Loss function - `sigmoid`, `hinge`, `ipo`, or `dpop`
+- `--dpo-cpo-loss-type`: Loss function - `sigmoid`, `hinge`, `ipo`, `dpop`, or `length_normalized`
 - `--delta`: Margin for hinge loss (default: 50.0)
 - `--reference-model-path`: Reference model path (uses main model if not specified)
 
@@ -601,7 +601,7 @@ python -m mlx_lm_lora.train_judge \
 
 ```shell
 --beta 0.1                        # KL penalty strength
---dpo-cpo-loss-type sigmoid       # sigmoid, hinge, ipo, dpop
+--dpo-cpo-loss-type sigmoid       # sigmoid, hinge, ipo, dpop, length_normalized
 --delta 50.0                      # Margin for hinge loss
 --reference-model-path <path>     # Reference model path
 ```

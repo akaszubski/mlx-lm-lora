@@ -274,7 +274,42 @@ def train_dpo(
     loss_fn: callable = dpo_loss,
     training_callback: TrainingCallback = None,
     loss_type="sigmoid",
+    use_compile: bool = True,
 ):
+    """Run DPO training over ``train_dataset``.
+
+    Args:
+        model: Trainable policy model (mx.nn.Module).
+        ref_model: Frozen reference model. May be ``None`` for a zero baseline
+            (debug only — produces a degenerate gradient).
+        optimizer: An MLX optimizer instance bound to ``model``.
+        train_dataset: Iterable preference dataset.
+        val_dataset: Validation dataset (same shape as ``train_dataset``).
+        args: ``DPOTrainingArgs`` controlling iters, batch size, beta, etc.
+        loss_fn: Loss function with the ``dpo_loss`` signature.
+        training_callback: Optional ``TrainingCallback``.
+        loss_type: One of ``"sigmoid"``, ``"hinge"``, ``"ipo"``, ``"dpop"``,
+            ``"length_normalized"``.
+        use_compile: If ``True`` (default), wrap the per-step graph in
+            ``mx.compile``. **Set ``False`` for full-parameter fine-tuning.**
+
+    Notes:
+        ``mx.compile`` traces and caches the per-step graph together with the
+        captured ``state`` (model + optimizer). For LoRA the trainable subgraph
+        is small and the in-place ``optimizer.update(model, grad)`` re-binds
+        correctly on every call. For full-parameter fine-tuning the in-place
+        update is silently skipped on subsequent calls — the LR counter
+        advances (it lives in ``optimizer.state`` inside the traced state) but
+        model weights never change. Symptoms: saved adapters are byte-identical
+        to the source checkpoint, ``final_loss`` converges to
+        ``ln(2) ≈ 0.6931`` (policy ≡ ref → reward = β·0 → -log σ(0)) and all
+        reward channels are ``0.0``.
+
+        Pass ``use_compile=False`` for full-parameter fine-tuning. Reproducer
+        and regression test:
+        ``tests/integration/test_dpo_actually_learns.py`` in the realign repo
+        (Issue #990).
+    """
     mx.set_wired_limit(mx.metal.device_info()["max_recommended_working_set_size"])
     tqdm.write(f"Starting training..., iters: {args.iters}")
     world = mx.distributed.init()
@@ -334,8 +369,7 @@ def train_dpo(
 
     loss_value_and_grad = nn.value_and_grad(model, loss_wrapper)
 
-    @partial(mx.compile, inputs=state, outputs=state)
-    def step(batch, prev_grad, do_update):
+    def _step_impl(batch, prev_grad, do_update):
         chosen, rejected, chosen_masks, rejected_masks = batch
 
         (lvalue, reward, toks, metrics), grad = loss_value_and_grad(
@@ -353,6 +387,14 @@ def train_dpo(
             grad = None
 
         return lvalue, reward, toks, metrics, grad
+
+    # ``state`` (defined above) is captured by reference; calling
+    # ``partial(mx.compile, inputs=state, outputs=state)(_step_impl)`` is
+    # equivalent to the decorator form ``@partial(mx.compile, ...)``.
+    if use_compile:
+        step = partial(mx.compile, inputs=state, outputs=state)(_step_impl)
+    else:
+        step = _step_impl
 
     losses = 0
     rewards = mx.zeros((2,))

@@ -190,6 +190,12 @@ class DPODataset:
     ):
         self._chosen_data = []
         self._rejected_data = []
+        # Per-example PROMPT token length (prompt + assistant generation header, before
+        # the first completion token). Recorded so ``iterate_dpo_batches(mask_prompt=True)``
+        # can build AllenAI ``dpo_norm``'s completion-only loss mask (ReAlign #1506):
+        # the reference sets ``labels[:len(prompt)] = -100`` and reduces over completion
+        # tokens only. This is the TRUE rendered boundary, not an approximation.
+        self._prompt_lengths = []
 
         for d in data:
             messages = (
@@ -217,9 +223,22 @@ class DPODataset:
                     rejected_messages, add_generation_prompt=True
                 )
             )
+            # Render the prompt-only prefix (same add_generation_prompt=True) so the
+            # boundary aligns with the concatenated chosen/rejected renderings above.
+            self._prompt_lengths.append(
+                len(
+                    tokenizer.apply_chat_template(
+                        base_messages, add_generation_prompt=True
+                    )
+                )
+            )
 
     def __getitem__(self, idx: int):
-        return {"chosen": self._chosen_data[idx], "rejected": self._rejected_data[idx]}
+        return {
+            "chosen": self._chosen_data[idx],
+            "rejected": self._rejected_data[idx],
+            "prompt_len": self._prompt_lengths[idx],
+        }
 
     def __len__(self):
         return len(self._chosen_data)

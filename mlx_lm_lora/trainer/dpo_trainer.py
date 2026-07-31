@@ -133,8 +133,44 @@ def dpo_loss(
     return mx.mean(losses), reward, num_tokens, metrics
 
 
+def _completion_prompt_len(chosen_ids, rejected_ids, item=None):
+    """Resolve the PROMPT boundary (# leading tokens to exclude from the loss).
+
+    AllenAI open-instruct's reference DPO supervises ONLY completion tokens: it sets
+    ``labels[:len(prompt)] = -100`` and reduces with ``loss_mask = labels[:, 1:] != -100``
+    (dpo_utils.py:706-712) — the prompt tokens are dropped from BOTH the numerator and the
+    dpo_norm divisor. ReAlign #1506 brings the MLX path to that convention.
+
+    Prompt length is resolved in priority order:
+      1. ``item["prompt_len"]`` when the dataset carries an explicit boundary (the
+         ReAlign-owned ``DPODataset`` records the true rendered prompt-only token count).
+      2. The longest common prefix of the chosen and rejected token id lists. For a
+         preference pair both sequences are ``prompt + assistant-header + completion`` with
+         an IDENTICAL prefix, so the first divergent token IS the completion boundary. This
+         needs no separate prompt tokenization and — because it operates on the SAME
+         rendered+tokenized sequences the model sees — is immune to the BPE prompt/completion
+         seam-merge class of bug (ReAlign OLMo2 boundary gotchas). Its only imprecision is
+         when both completions happen to share a leading token, which symmetrically trims a
+         token or two off both completions — negligible for the length-normalized average.
+    """
+    if item is not None:
+        p = item.get("prompt_len")
+        if p is not None:
+            return int(p)
+    n = min(len(chosen_ids), len(rejected_ids))
+    i = 0
+    while i < n and chosen_ids[i] == rejected_ids[i]:
+        i += 1
+    return i
+
+
 def iterate_dpo_batches(
-    dataset, batch_size, max_seq_length, train=False, return_indices: bool = False
+    dataset,
+    batch_size,
+    max_seq_length,
+    train=False,
+    return_indices: bool = False,
+    mask_prompt: bool = False,
 ):
     """Iterate over DPO preference batches.
 
@@ -151,6 +187,14 @@ def iterate_dpo_batches(
             slot-position is not stable across `batch_size` choices). Default
             is ``False`` to preserve backward compatibility with all existing
             callers (upstream tests, ``evaluate_dpo``).
+        mask_prompt: When ``True``, the emitted chosen/rejected masks are
+            COMPLETION-ONLY loss masks (prompt tokens zeroed) rather than the
+            full attention mask — the AllenAI ``dpo_norm`` reference convention
+            (ReAlign #1506). The prompt boundary per row is resolved by
+            ``_completion_prompt_len`` (explicit ``prompt_len`` or chosen/rejected
+            common prefix). Default ``False`` yields the historical full-token
+            attention mask, byte-for-byte identical to the pre-#1506 behaviour so
+            every existing caller (SFT parity, upstream tests) is unaffected.
     """
     idx = sorted(range(len(dataset)), key=lambda idx: len(dataset[idx]["chosen"]))
 
@@ -202,6 +246,19 @@ def iterate_dpo_batches(
                 chosen_masks[j, :chosen_length] = 1.0
                 rejected_masks[j, :rejected_length] = 1.0
 
+                if mask_prompt:
+                    # Completion-only loss mask (AllenAI dpo_norm, #1506): zero the
+                    # prompt prefix so it leaves BOTH the numerator and the divisor.
+                    # Clamp so >= 1 completion token survives per row (a non-zero
+                    # length_normalized divisor; mirrors the reference clamp).
+                    prompt_len = _completion_prompt_len(
+                        batch[j]["chosen"], batch[j]["rejected"], item=batch[j]
+                    )
+                    c_cut = min(prompt_len, max(chosen_length - 1, 0))
+                    r_cut = min(prompt_len, max(rejected_length - 1, 0))
+                    chosen_masks[j, :c_cut] = 0.0
+                    rejected_masks[j, :r_cut] = 0.0
+
             if return_indices:
                 yield (
                     mx.array(chosen_arr),
@@ -231,6 +288,7 @@ def evaluate_dpo(
     loss_type,
     loss_fn: callable = dpo_loss,
     ref_score_fn=None,
+    mask_prompt: bool = False,
 ):
     """Evaluate DPO loss / rewards over ``dataset``.
 
@@ -241,6 +299,10 @@ def evaluate_dpo(
             cached scores are gathered by global JSONL index. ``ref_model`` is
             ignored when ``ref_score_fn`` is not ``None``. Default ``None``
             preserves the existing live-ref behaviour.
+        mask_prompt: When ``True``, score COMPLETION tokens only (AllenAI
+            ``dpo_norm`` reference convention, #1506) — threaded to
+            ``iterate_dpo_batches``. Default ``False`` = historical full-token
+            behaviour.
     """
     all_losses = 0
     all_rewards = mx.zeros((2,))
@@ -257,6 +319,7 @@ def evaluate_dpo(
             batch_size=batch_size,
             max_seq_length=max_seq_length,
             return_indices=use_cached_ref,
+            mask_prompt=mask_prompt,
         ),
     ):
         if use_cached_ref:
@@ -342,6 +405,7 @@ def train_dpo(
     loss_type="sigmoid",
     use_compile: bool = True,
     ref_score_fn=None,
+    mask_prompt: bool = False,
 ):
     """Run DPO training over ``train_dataset``.
 
@@ -517,6 +581,7 @@ def train_dpo(
                 max_seq_length=args.max_seq_length,
                 train=True,
                 return_indices=use_cached_ref,
+                mask_prompt=mask_prompt,
             )
         )
         if use_cached_ref:
@@ -553,6 +618,7 @@ def train_dpo(
                 delta=args.delta,
                 loss_type=loss_type,
                 ref_score_fn=ref_score_fn,
+                mask_prompt=mask_prompt,
             )
             val_time = time.perf_counter() - stop
             if rank == 0:

@@ -11,13 +11,17 @@ from mlx_lm.tuner.callbacks import TrainingCallback
 from tqdm import tqdm
 
 from .dpo_trainer import DPOTrainingArgs as CPOTrainingArgs
+
+# Import the shared TARGET-position ``get_token_scores`` instead of carrying a private
+# copy (ReAlign #1505/#1506). The sibling online_dpo/xpo/ppo trainers already import it
+# from ``.dpo_trainer``; this file previously duplicated a pre-#1505 SOURCE-position copy
+# (``mask[:, :-1]``) that over-counted the last-real→first-pad prediction on padded rows
+# (~11 nats/row) and diverged from AllenAI open-instruct's reference DPO
+# (``dpo_utils._get_batch_logps``: ``labels[:, 1:] != -100``, TARGET position). CPO is
+# unreachable from ReAlign today, but importing keeps the whole fork on ONE correct
+# scoring function so a future CPO caller can never resurrect the divergent mask.
+from .dpo_trainer import get_token_scores  # noqa: F401 — re-exported for CPO callers
 from .sft_trainer import grad_checkpoint
-
-
-def get_token_scores(model, x, mask):
-    inputs, targets = x[:, :-1], x[:, 1:]
-    logits = model(inputs).astype(mx.float32)
-    return -nn.losses.cross_entropy(logits, targets) * mask[:, :-1]
 
 
 def compute_score(scores, mask, loss_type):

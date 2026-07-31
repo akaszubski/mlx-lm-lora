@@ -512,6 +512,90 @@ def train_dpo(
 
     loss_value_and_grad = nn.value_and_grad(model, loss_wrapper)
 
+    # ReAlign #1493: full fwd+bwd numerical canary INSIDE the vendored loop.
+    # Runs ONE real fwd+bwd micro-step through the REAL ``loss_value_and_grad``
+    # (the SAME closure the loop uses — no reconstruction, so it cannot drift from
+    # the trained loss) on the first batch, built with the SAME mask_prompt-aware
+    # ``iterate_dpo_batches`` construction, and HARD-FAILS on non-finite loss/grad
+    # BEFORE the multi-hour run. This is the full fwd+bwd upgrade to the realign
+    # wrapper's forward-only pre-flight (#1429 native canary, #1439 parity
+    # propagation, #1493 this delivery). ``optimizer.update`` is NEVER called here,
+    # so model weights are NOT mutated. ``train=False`` yields a deterministic
+    # (shortest-first) batch that consumes no ``np.random``; the only RNG draw is
+    # LoRA dropout inside the train-mode forward, so we snapshot/restore
+    # ``mx.random.state`` to keep the training trajectory byte-for-byte identical
+    # (mirrors the native GRPO canary, #1439). The import is GUARDED so this fork
+    # stays importable standalone when ``realign`` is not on the path
+    # (external/patches/ ships this into the gitignored soft-fork).
+    try:
+        from realign.core.numerical_canary import (
+            assert_finite_loss_and_grads as _realign_assert_finite_canary,
+        )
+    except ImportError:
+        # Narrow to ImportError (realign not on the path when the fork runs
+        # standalone). Emit a VISIBLE line so a silently-vanished canary is
+        # impossible — a broad `except Exception` could swallow a real bug in the
+        # canary module and leave the run unguarded without a trace (#1493).
+        _realign_assert_finite_canary = None
+        tqdm.write(
+            "DPO numerical canary unavailable (realign not importable) — "
+            "skipping #1493 pre-flight."
+        )
+
+    if _realign_assert_finite_canary is not None and args.iters > 0:
+        _canary_rng_state = mx.random.state
+        try:
+            _canary_batch = next(
+                iterate_dpo_batches(
+                    dataset=train_dataset,
+                    batch_size=args.batch_size,
+                    max_seq_length=args.max_seq_length,
+                    train=False,
+                    return_indices=use_cached_ref,
+                    mask_prompt=mask_prompt,
+                )
+            )
+            if use_cached_ref:
+                (
+                    _c_chosen,
+                    _c_rejected,
+                    _c_chosen_masks,
+                    _c_rejected_masks,
+                    _c_indices,
+                ) = _canary_batch
+                _c_ref_chosen, _c_ref_rejected = ref_score_fn(_c_indices)
+                (_c_loss, _c_reward, _c_toks, _c_metrics), _c_grad = (
+                    loss_value_and_grad(
+                        _c_chosen,
+                        _c_rejected,
+                        _c_chosen_masks,
+                        _c_rejected_masks,
+                        _c_ref_chosen,
+                        _c_ref_rejected,
+                    )
+                )
+            else:
+                (
+                    _c_chosen,
+                    _c_rejected,
+                    _c_chosen_masks,
+                    _c_rejected_masks,
+                ) = _canary_batch
+                (_c_loss, _c_reward, _c_toks, _c_metrics), _c_grad = (
+                    loss_value_and_grad(
+                        _c_chosen, _c_rejected, _c_chosen_masks, _c_rejected_masks
+                    )
+                )
+            _realign_assert_finite_canary(_c_loss, _c_grad, step=1, steps=1)
+            tqdm.write(
+                "DPO pre-flight numerical canary PASSED (#1493): first-batch "
+                f"loss {float(_c_loss.item()):.4f}, gradients finite "
+                "(no weight update)."
+            )
+        finally:
+            mx.random.state = _canary_rng_state
+            mx.clear_cache()
+
     def _step_impl(batch, prev_grad, do_update):
         if use_cached_ref:
             (

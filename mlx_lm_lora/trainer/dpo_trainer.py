@@ -37,9 +37,27 @@ class DPOTrainingArgs(SFTTrainingArgs):
 
 
 def get_token_scores(model, x, mask):
+    # Per-token score index i = log p(targets[i] | inputs[i]) = log p(x[i+1] | x[i]).
+    # The score at index i predicts the TARGET token at absolute position i+1, so it is
+    # valid iff that target token is real (not padding). We therefore mask with the
+    # TARGET-position slice ``mask[:, 1:]`` (mask[i+1]), NOT the source slice
+    # ``mask[:, :-1]`` (mask[i]).
+    #
+    # This matches AllenAI open-instruct's reference DPO exactly:
+    #   dpo_utils._get_batch_logps: loss_mask = labels[:, 1:] != -100  (TARGET position)
+    #   applied to per_token_logps[:, :-1] where per_token_logps[i] = log p(labels[i+1]|x_i).
+    # (open-instruct/open_instruct/dpo_utils.py:706-712, calculate_per_token_logps at
+    #  padding_free_collator.py:10-16). The reference is authoritative.
+    #
+    # The prior ``mask[:, :-1]`` (SOURCE position) wrongly counted the last-real→first-pad
+    # prediction on every PADDED row (~11 nats/row), diverging from both the reference and
+    # the torch backend (which already masks at ``attention_mask[:, 1:]``). On equal-length
+    # un-padded rows the two slices coincide, so this is a no-op there. Fixed in ReAlign
+    # #1505; the DPO stage had not yet run under the divergent mask (SFT-only bake), so no
+    # ladder checkpoint is affected.
     inputs, targets = x[:, :-1], x[:, 1:]
     logits = model(inputs).astype(mx.float32)
-    return -nn.losses.cross_entropy(logits, targets) * mask[:, :-1]
+    return -nn.losses.cross_entropy(logits, targets) * mask[:, 1:]
 
 
 def compute_score(scores, mask, loss_type):
@@ -115,7 +133,25 @@ def dpo_loss(
     return mx.mean(losses), reward, num_tokens, metrics
 
 
-def iterate_dpo_batches(dataset, batch_size, max_seq_length, train=False):
+def iterate_dpo_batches(
+    dataset, batch_size, max_seq_length, train=False, return_indices: bool = False
+):
+    """Iterate over DPO preference batches.
+
+    Args:
+        dataset: List-like of dicts with ``chosen`` / ``rejected`` token id lists.
+        batch_size: Effective per-step micro batch size (pre-distributed).
+        max_seq_length: Cap for token sequences in the padded tensors.
+        train: When ``True``, shuffle batch order each epoch and loop forever.
+        return_indices: When ``True`` (default ``False``), additionally yield a
+            5th tensor with the GLOBAL dataset indices for the current batch.
+            This is required by the reference-logprob precompute path which
+            needs to address scores by JSONL-row, not by per-batch slot
+            (mlx-lm-lora `iterate_dpo_batches` sorts by `len(chosen)` so the
+            slot-position is not stable across `batch_size` choices). Default
+            is ``False`` to preserve backward compatibility with all existing
+            callers (upstream tests, ``evaluate_dpo``).
+    """
     idx = sorted(range(len(dataset)), key=lambda idx: len(dataset[idx]["chosen"]))
 
     step = mx.distributed.init().size()
@@ -166,9 +202,18 @@ def iterate_dpo_batches(dataset, batch_size, max_seq_length, train=False):
                 chosen_masks[j, :chosen_length] = 1.0
                 rejected_masks[j, :rejected_length] = 1.0
 
-            yield mx.array(chosen_arr), mx.array(rejected_arr), mx.array(
-                chosen_masks
-            ), mx.array(rejected_masks)
+            if return_indices:
+                yield (
+                    mx.array(chosen_arr),
+                    mx.array(rejected_arr),
+                    mx.array(chosen_masks),
+                    mx.array(rejected_masks),
+                    mx.array(batch_idx[i], dtype=mx.int32),
+                )
+            else:
+                yield mx.array(chosen_arr), mx.array(rejected_arr), mx.array(
+                    chosen_masks
+                ), mx.array(rejected_masks)
 
         if not train:
             break
@@ -185,7 +230,18 @@ def evaluate_dpo(
     max_seq_length,
     loss_type,
     loss_fn: callable = dpo_loss,
+    ref_score_fn=None,
 ):
+    """Evaluate DPO loss / rewards over ``dataset``.
+
+    Args:
+        ref_score_fn: Optional callable ``(batch_indices: mx.array) -> (
+            chosen_ref_score: mx.array, rejected_ref_score: mx.array)``. When
+            provided, the per-batch reference forward pass is skipped and
+            cached scores are gathered by global JSONL index. ``ref_model`` is
+            ignored when ``ref_score_fn`` is not ``None``. Default ``None``
+            preserves the existing live-ref behaviour.
+    """
     all_losses = 0
     all_rewards = mx.zeros((2,))
     all_metrics = None
@@ -193,15 +249,21 @@ def evaluate_dpo(
 
     index_iterator = iter(range(num_batches)) if num_batches != -1 else iter(int, 1)
 
+    use_cached_ref = ref_score_fn is not None
     for _, batch in zip(
         index_iterator,
         iterate_dpo_batches(
             dataset=dataset,
             batch_size=batch_size,
             max_seq_length=max_seq_length,
+            return_indices=use_cached_ref,
         ),
     ):
-        chosen, rejected, chosen_masks, rejected_masks = batch
+        if use_cached_ref:
+            chosen, rejected, chosen_masks, rejected_masks, batch_indices = batch
+        else:
+            chosen, rejected, chosen_masks, rejected_masks = batch
+            batch_indices = None
 
         policy_chosen_scores = get_token_scores(model, chosen, chosen_masks)
         policy_rejected_scores = get_token_scores(model, rejected, rejected_masks)
@@ -213,7 +275,11 @@ def evaluate_dpo(
             policy_rejected_scores, rejected_masks, loss_type
         )
 
-        if ref_model is None:
+        if use_cached_ref:
+            reference_chosen_score, reference_rejected_score = ref_score_fn(
+                batch_indices
+            )
+        elif ref_model is None:
             reference_chosen_score = mx.zeros_like(policy_chosen_score)
             reference_rejected_score = mx.zeros_like(policy_rejected_score)
         else:
@@ -275,6 +341,7 @@ def train_dpo(
     training_callback: TrainingCallback = None,
     loss_type="sigmoid",
     use_compile: bool = True,
+    ref_score_fn=None,
 ):
     """Run DPO training over ``train_dataset``.
 
@@ -327,7 +394,16 @@ def train_dpo(
 
     state = [model.state, optimizer.state, mx.random.state]
 
-    def loss_wrapper(chosen, rejected, chosen_masks, rejected_masks):
+    use_cached_ref = ref_score_fn is not None
+
+    def loss_wrapper(
+        chosen,
+        rejected,
+        chosen_masks,
+        rejected_masks,
+        reference_chosen_score=None,
+        reference_rejected_score=None,
+    ):
         policy_chosen_scores = get_token_scores(model, chosen, chosen_masks)
         policy_rejected_scores = get_token_scores(model, rejected, rejected_masks)
 
@@ -338,7 +414,10 @@ def train_dpo(
             policy_rejected_scores, rejected_masks, loss_type
         )
 
-        if ref_model is None:
+        if reference_chosen_score is not None and reference_rejected_score is not None:
+            # Cached-ref path — pre-gathered scores are passed in by caller.
+            pass
+        elif ref_model is None:
             reference_chosen_score = mx.zeros_like(policy_chosen_score)
             reference_rejected_score = mx.zeros_like(policy_rejected_score)
         else:
@@ -370,11 +449,28 @@ def train_dpo(
     loss_value_and_grad = nn.value_and_grad(model, loss_wrapper)
 
     def _step_impl(batch, prev_grad, do_update):
-        chosen, rejected, chosen_masks, rejected_masks = batch
-
-        (lvalue, reward, toks, metrics), grad = loss_value_and_grad(
-            chosen, rejected, chosen_masks, rejected_masks
-        )
+        if use_cached_ref:
+            (
+                chosen,
+                rejected,
+                chosen_masks,
+                rejected_masks,
+                ref_chosen_score,
+                ref_rejected_score,
+            ) = batch
+            (lvalue, reward, toks, metrics), grad = loss_value_and_grad(
+                chosen,
+                rejected,
+                chosen_masks,
+                rejected_masks,
+                ref_chosen_score,
+                ref_rejected_score,
+            )
+        else:
+            chosen, rejected, chosen_masks, rejected_masks = batch
+            (lvalue, reward, toks, metrics), grad = loss_value_and_grad(
+                chosen, rejected, chosen_masks, rejected_masks
+            )
 
         if prev_grad is not None:
             grad = tree_map(lambda x, y: x + y, grad, prev_grad)
@@ -414,14 +510,34 @@ def train_dpo(
     start = time.perf_counter()
     pbar = tqdm(range(1, args.iters + 1), desc="Training", disable=rank != 0)
     for it in pbar:
-        batch = next(
+        raw_batch = next(
             iterate_dpo_batches(
                 dataset=train_dataset,
                 batch_size=args.batch_size,
                 max_seq_length=args.max_seq_length,
                 train=True,
+                return_indices=use_cached_ref,
             )
         )
+        if use_cached_ref:
+            (
+                _chosen,
+                _rejected,
+                _chosen_masks,
+                _rejected_masks,
+                _batch_indices,
+            ) = raw_batch
+            ref_chosen_score, ref_rejected_score = ref_score_fn(_batch_indices)
+            batch = (
+                _chosen,
+                _rejected,
+                _chosen_masks,
+                _rejected_masks,
+                ref_chosen_score,
+                ref_rejected_score,
+            )
+        else:
+            batch = raw_batch
 
         if it == 1 or it % args.steps_per_eval == 0 or it == args.iters:
             stop = time.perf_counter()
@@ -436,6 +552,7 @@ def train_dpo(
                 beta=args.beta,
                 delta=args.delta,
                 loss_type=loss_type,
+                ref_score_fn=ref_score_fn,
             )
             val_time = time.perf_counter() - stop
             if rank == 0:
